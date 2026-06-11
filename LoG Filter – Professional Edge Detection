@@ -1,0 +1,648 @@
+import numpy as np
+import math
+from scipy.ndimage import gaussian_laplace, gaussian_filter
+from qgis.core import (
+    QgsRasterLayer, QgsProject, Qgis,
+    QgsRasterFileWriter, QgsRasterBlock
+)
+from qgis.utils import iface
+from PyQt5.QtWidgets import (
+    QDialog, QVBoxLayout, QLabel, QComboBox, 
+    QPushButton, QProgressBar, QApplication
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+import tempfile
+import traceback
+import time
+
+# ============================================================================
+# ULTRA-FAST RASTER READER - USING NUMPY FROMBUFFER
+# ============================================================================
+
+def read_raster_ultrafast(raster_layer, band=1, progress_callback=None):
+    """
+    ULTRA-FAST raster reading using QgsRasterBlock with numpy frombuffer
+    This is the fastest possible method in QGIS
+    """
+    provider = raster_layer.dataProvider()
+    width = raster_layer.width()
+    height = raster_layer.height()
+    extent = raster_layer.extent()
+    
+    # Initialize arrays
+    data = np.zeros((height, width), dtype=np.float32)
+    mask = np.zeros((height, width), dtype=bool)
+    
+    # Get NoData value
+    no_data = provider.sourceNoDataValue(band)
+    
+    # Read entire block
+    block = provider.block(band, extent, width, height)
+    
+    # Try fast path - read entire rows at once using frombuffer
+    try:
+        for i in range(height):
+            row_data = block.data(i)
+            if row_data and len(row_data) >= width * 4:  # 4 bytes per float32
+                # Fast path: convert bytes to float32 array
+                values = np.frombuffer(row_data, dtype=np.float32)[:width]
+                data[i, :] = values
+                
+                # Vectorized NoData detection
+                if no_data is not None and not np.isnan(no_data):
+                    mask[i, :] = (np.abs(values - no_data) < 0.001) | np.isnan(values)
+            
+            # Progress callback for large rasters
+            if progress_callback and i % 100 == 0:
+                progress_callback(int(i / height * 100))
+                
+    except Exception as e:
+        # Fallback to block.value() - slower but reliable
+        print(f"  Fast reading failed, using fallback method: {str(e)[:50]}")
+        for i in range(height):
+            for j in range(width):
+                try:
+                    val = block.value(i, j)
+                    if val is not None and not np.isnan(val):
+                        if no_data is None or abs(val - no_data) > 0.001:
+                            data[i, j] = float(val)
+                        else:
+                            data[i, j] = np.nan
+                            mask[i, j] = True
+                    else:
+                        data[i, j] = np.nan
+                        mask[i, j] = True
+                except Exception as e2:
+                    data[i, j] = np.nan
+                    mask[i, j] = True
+            
+            if progress_callback and i % 50 == 0:
+                progress_callback(int(i / height * 100))
+    
+    # Fill NoData with median (vectorized)
+    if np.any(mask):
+        valid = data[~mask]
+        if len(valid) > 0:
+            median_val = np.median(valid)
+            data[mask] = median_val
+            print(f"  Filled {np.sum(mask)} NoData pixels ({(np.sum(mask)/(height*width))*100:.1f}%)")
+    
+    return data, mask, width, height, extent
+
+
+def get_grayscale_ultrafast(raster_layer, progress_callback=None):
+    """Ultra-fast grayscale conversion"""
+    provider = raster_layer.dataProvider()
+    band_count = provider.bandCount()
+    
+    print(f"  Band count: {band_count}")
+    
+    if band_count == 1:
+        print("  Single band raster")
+        return read_raster_ultrafast(raster_layer, 1, progress_callback)
+    
+    # Read RGB bands
+    print("  Reading RGB bands...")
+    r_data, mask_r, w, h, ext = read_raster_ultrafast(raster_layer, 1, progress_callback)
+    
+    if band_count >= 3:
+        g_data, mask_g, _, _, _ = read_raster_ultrafast(raster_layer, 2, progress_callback)
+        b_data, mask_b, _, _, _ = read_raster_ultrafast(raster_layer, 3, progress_callback)
+        
+        # Vectorized RGB to grayscale
+        gray = 0.299 * r_data + 0.587 * g_data + 0.114 * b_data
+        combined_mask = mask_r | mask_g | mask_b
+        gray[combined_mask] = np.nan
+        print("  RGB to grayscale complete")
+    else:
+        gray = r_data
+        combined_mask = mask_r
+    
+    return gray, combined_mask, w, h, ext
+
+
+# ============================================================================
+# IMPROVED LAYER TYPE DETECTION - MULTI-CRITERIA
+# ============================================================================
+
+def detect_type_advanced(data, mask):
+    """
+    Advanced layer type detection using multiple criteria
+    Returns: 'DEM' or 'IMAGERY' and confidence score
+    """
+    valid = data[~mask]
+    
+    if len(valid) < 1000:
+        return "IMAGERY", 0.5
+    
+    # Calculate multiple metrics
+    dynamic_range = np.max(valid) - np.min(valid)
+    std_val = np.std(valid)
+    mean_val = np.mean(valid)
+    
+    # Check for integer values (typical for DEMs)
+    unique_vals = len(np.unique(valid[:min(10000, len(valid))].astype(int)))
+    unique_ratio = unique_vals / min(10000, len(valid))
+    
+    # Check if values look like elevation (positive, large range)
+    is_large_range = dynamic_range > 3000
+    is_high_std = std_val > 100
+    is_integer_like = unique_ratio < 0.1
+    is_positive = mean_val > 0
+    
+    # Scoring system
+    dem_score = 0
+    imagery_score = 0
+    
+    if is_large_range:
+        dem_score += 3
+    else:
+        imagery_score += 1
+    
+    if is_high_std:
+        dem_score += 2
+    else:
+        imagery_score += 1
+    
+    if is_integer_like:
+        dem_score += 2
+    
+    if is_positive and dynamic_range > 100:
+        dem_score += 1
+    
+    # Typical imagery has values 0-255
+    if mean_val < 200 and std_val < 80 and dynamic_range < 300:
+        imagery_score += 3
+    
+    result = "DEM" if dem_score > imagery_score else "IMAGERY"
+    confidence = max(dem_score, imagery_score) / 6.0
+    
+    print(f"  Detection: range={dynamic_range:.0f}, std={std_val:.1f}, unique_ratio={unique_ratio:.3f}")
+    print(f"  Result: {result} (confidence: {confidence:.0%})")
+    
+    return result, confidence
+
+
+# ============================================================================
+# PREPROCESSING
+# ============================================================================
+
+def preprocess_dem(data, mask):
+    """DEM preprocessing with edge preservation"""
+    valid = data[~mask]
+    if len(valid) == 0:
+        return data
+    
+    # Robust statistics
+    mean = np.mean(valid)
+    std = np.std(valid) + 1e-6
+    
+    # Adaptive clipping based on distribution
+    if std > 100:
+        p1, p99 = np.percentile(valid, [0.5, 99.5])
+    else:
+        p1, p99 = np.percentile(valid, [1, 99])
+    
+    data_clipped = np.clip(data, p1, p99)
+    normalized = (data_clipped - mean) / std
+    
+    # Tanh normalization (bounded)
+    result = np.where(~mask, np.tanh(normalized), np.nan)
+    
+    return result
+
+
+def preprocess_imagery(data, mask):
+    """Imagery preprocessing"""
+    valid = data[~mask]
+    if len(valid) == 0:
+        return data
+    
+    # Adaptive percentile clipping
+    if len(valid) > 10000:
+        p2, p98 = np.percentile(valid, [2, 98])
+    else:
+        p2, p98 = np.percentile(valid, [5, 95])
+    
+    if p98 > p2:
+        clipped = np.clip(data, p2, p98)
+        normalized = (clipped - p2) / (p98 - p2)
+    else:
+        normalized = data
+    
+    result = np.where(~mask, normalized - 0.5, np.nan)
+    
+    return result
+
+
+# ============================================================================
+# LOG FILTER WITH PROGRESS
+# ============================================================================
+
+def apply_log_filter_with_progress(data, sigma, layer_type, quality, mask, progress_callback=None):
+    """Apply LoG filter with progress reporting"""
+    
+    # Fill NaN for filtering
+    data_filled = data.copy()
+    if np.any(mask):
+        valid_median = np.nanmedian(data)
+        data_filled[mask] = valid_median
+    
+    if progress_callback:
+        progress_callback(70)
+    
+    if layer_type == "DEM":
+        result = gaussian_laplace(data_filled, sigma=sigma)
+    else:
+        smooth_factor = 0.55
+        if quality == "high":
+            smooth_factor = 0.4
+        elif quality == "low":
+            smooth_factor = 0.7
+        
+        smooth = gaussian_filter(data_filled, sigma=sigma * smooth_factor)
+        
+        if progress_callback:
+            progress_callback(75)
+        
+        result = gaussian_laplace(smooth, sigma=sigma)
+    
+    if progress_callback:
+        progress_callback(80)
+    
+    # Restore mask
+    result[mask] = np.nan
+    
+    return result
+
+
+# ============================================================================
+# SCALING
+# ============================================================================
+
+def scale_to_byte_adaptive(data, mask, layer_type, sigma):
+    """Adaptive scaling with outlier rejection"""
+    valid = data[~mask]
+    
+    if valid.size == 0:
+        return np.zeros_like(data, dtype=np.uint8)
+    
+    if layer_type == "DEM":
+        # More conservative scaling for DEM
+        max_abs = np.percentile(np.abs(valid), 95)
+        if max_abs > 0:
+            scaled = (data / max_abs) * 127.5 + 127.5
+        else:
+            scaled = np.zeros_like(data) + 127.5
+        scaled = np.clip(scaled, 0, 255)
+    else:
+        # Adaptive percentiles based on sigma
+        if sigma < 1.0:
+            p_low, p_high = 1, 99
+        elif sigma < 2.0:
+            p_low, p_high = 2, 98
+        else:
+            p_low, p_high = 5, 95
+        
+        p_low_val = np.percentile(valid, p_low)
+        p_high_val = np.percentile(valid, p_high)
+        
+        if p_high_val > p_low_val:
+            scaled = (data - p_low_val) / (p_high_val - p_low_val) * 255
+        else:
+            scaled = np.zeros_like(data)
+        
+        scaled = np.clip(scaled, 0, 255)
+    
+    scaled[mask] = 0
+    return scaled.astype(np.uint8)
+
+
+# ============================================================================
+# SIGMA CALCULATION
+# ============================================================================
+
+def get_sigma_adaptive(layer_type, width, height, quality, custom_sigma):
+    """Adaptive sigma calculation"""
+    if custom_sigma is not None:
+        return custom_sigma
+    
+    # Base sigma depends on image size
+    resolution = min(width, height)
+    
+    if layer_type == "DEM":
+        # Smaller sigma for DEM to preserve micro-relief
+        base = 1.0
+        scale = math.log10(resolution + 1) / 4.5
+        sigma = base * (0.8 + scale)
+        sigma = max(0.7, min(2.2, sigma))
+    else:
+        # Larger sigma for imagery
+        base = 1.0
+        scale = math.log10(resolution + 1) / 3.2
+        sigma = base * (0.7 + scale)
+        
+        if quality == "high":
+            sigma *= 0.7
+        elif quality == "low":
+            sigma *= 1.3
+        
+        sigma = max(0.6, min(3.5, sigma))
+    
+    return sigma
+
+
+# ============================================================================
+# WRITE RASTER - OPTIMIZED
+# ============================================================================
+
+def write_raster_optimized(output_path, data, extent, crs, width, height):
+    """Optimized raster writing - single block"""
+    writer = QgsRasterFileWriter(output_path)
+    writer.setOutputFormat('GTiff')
+    
+    provider = writer.createOneBandRaster(Qgis.Byte, width, height, extent, crs)
+    
+    if provider is None:
+        raise Exception("Failed to create raster")
+    
+    # Write entire dataset in one block for speed
+    block = QgsRasterBlock(Qgis.Byte, width, height)
+    block.setData(data.astype(np.uint8).tobytes())
+    provider.writeBlock(block, 1)
+    provider.setNoDataValue(1, 0)
+    
+    print(f"  Written {width}x{height} raster")
+
+
+# ============================================================================
+# DIALOG
+# ============================================================================
+
+class LoGDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("LoG Filter - Edge Detection")
+        self.setModal(True)
+        self.setMinimumWidth(450)
+        
+        layout = QVBoxLayout()
+        
+        layout.addWidget(QLabel("Raster Type:"))
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["Automatic (recommended)", "IMAGERY", "DEM"])
+        layout.addWidget(self.type_combo)
+        
+        layout.addWidget(QLabel("Quality (for IMAGERY only):"))
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(["high (UAV/Orthophoto)", "medium (Sentinel-2)", "low (Landsat/SRTM)"])
+        layout.addWidget(self.quality_combo)
+        
+        layout.addWidget(QLabel("Sigma (leave Auto for optimal):"))
+        self.sigma_combo = QComboBox()
+        self.sigma_combo.addItems(["Auto", "0.5", "1.0", "1.5", "2.0", "2.5", "3.0"])
+        layout.addWidget(self.sigma_combo)
+        
+        self.btn = QPushButton("Start Processing")
+        self.btn.clicked.connect(self.accept)
+        layout.addWidget(self.btn)
+        
+        self.setLayout(layout)
+    
+    def get_settings(self):
+        type_idx = self.type_combo.currentIndex()
+        if type_idx == 0:
+            layer_type = "AUTO"
+        elif type_idx == 1:
+            layer_type = "IMAGERY"
+        else:
+            layer_type = "DEM"
+        
+        quality_text = self.quality_combo.currentText()
+        if "high" in quality_text:
+            quality = "high"
+        elif "medium" in quality_text:
+            quality = "medium"
+        else:
+            quality = "low"
+        
+        sigma_text = self.sigma_combo.currentText()
+        if sigma_text == "Auto":
+            sigma = None
+        else:
+            sigma = float(sigma_text)
+        
+        return layer_type, quality, sigma
+
+
+# ============================================================================
+# WORKER THREAD - FINAL VERSION
+# ============================================================================
+
+class LoGWorker(QThread):
+    progress = pyqtSignal(int)
+    status = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+    
+    def __init__(self, raster_layer, layer_type, quality, sigma):
+        super().__init__()
+        self.raster_layer = raster_layer
+        self.layer_type = layer_type
+        self.quality = quality
+        self.custom_sigma = sigma
+    
+    def run(self):
+        start_time = time.time()
+        
+        try:
+            # Step 1: Read raster
+            self.status.emit("Reading raster data...")
+            self.progress.emit(10)
+            
+            def read_progress(pct):
+                self.progress.emit(10 + int(pct * 0.2))
+            
+            if self.raster_layer.dataProvider().bandCount() > 1:
+                data, mask, width, height, extent = get_grayscale_ultrafast(
+                    self.raster_layer, read_progress
+                )
+            else:
+                data, mask, width, height, extent = read_raster_ultrafast(
+                    self.raster_layer, 1, read_progress
+                )
+            
+            self.progress.emit(30)
+            
+            # Step 2: Detect type
+            if self.layer_type == "AUTO":
+                final_type, confidence = detect_type_advanced(data, mask)
+                if confidence < 0.6:
+                    self.status.emit(f"Warning: Low confidence detection ({confidence:.0%}), verify result")
+            else:
+                final_type = self.layer_type
+            
+            self.status.emit(f"Type: {final_type}")
+            self.progress.emit(40)
+            
+            # Step 3: Preprocess
+            self.status.emit("Preprocessing...")
+            if final_type == "DEM":
+                processed = preprocess_dem(data, mask)
+            else:
+                processed = preprocess_imagery(data, mask)
+            
+            self.progress.emit(50)
+            
+            # Step 4: Calculate sigma
+            sigma = get_sigma_adaptive(final_type, width, height, self.quality, self.custom_sigma)
+            self.status.emit(f"Sigma: {sigma:.2f}")
+            self.progress.emit(55)
+            
+            # Step 5: Apply LoG
+            self.status.emit("Applying LoG filter...")
+            
+            def log_progress(pct):
+                self.progress.emit(55 + int(pct * 0.25))
+            
+            filtered = apply_log_filter_with_progress(
+                processed, sigma, final_type, self.quality, mask, log_progress
+            )
+            
+            self.progress.emit(80)
+            
+            # Step 6: Scale output
+            self.status.emit("Scaling output...")
+            output = scale_to_byte_adaptive(filtered, mask, final_type, sigma)
+            
+            self.progress.emit(90)
+            
+            # Step 7: Write raster
+            self.status.emit("Writing raster...")
+            temp_file = tempfile.NamedTemporaryFile(suffix='.tif', delete=False)
+            temp_file.close()
+            
+            write_raster_optimized(temp_file.name, output, extent, self.raster_layer.crs(), width, height)
+            
+            elapsed = time.time() - start_time
+            print(f"  Processing time: {elapsed:.1f} seconds")
+            
+            self.progress.emit(100)
+            self.finished.emit(temp_file.name)
+            
+        except Exception as e:
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            self.error.emit(error_msg)
+
+
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
+
+log_worker = None
+
+def run_log_filter():
+    """Main function - final production version"""
+    global log_worker
+    
+    print("=" * 60)
+    print("LoG FILTER v5.0 - Professional Edge Detection")
+    print("=" * 60)
+    
+    # Get active layer
+    active_layer = iface.activeLayer()
+    
+    if active_layer is None:
+        iface.messageBar().pushMessage("Error", "Select a raster layer first!", level=Qgis.Critical, duration=3)
+        print("ERROR: No active layer")
+        return
+    
+    if active_layer.type() != QgsRasterLayer.RasterLayer:
+        iface.messageBar().pushMessage("Error", "Selected layer is not a raster!", level=Qgis.Critical, duration=3)
+        print("ERROR: Not a raster layer")
+        return
+    
+    print(f"Layer: {active_layer.name()}")
+    print(f"Size: {active_layer.width()} x {active_layer.height()}")
+    print(f"Bands: {active_layer.dataProvider().bandCount()}")
+    
+    # Show dialog
+    dialog = LoGDialog()
+    if dialog.exec_() != QDialog.Accepted:
+        print("Cancelled by user")
+        return
+    
+    layer_type, quality, sigma = dialog.get_settings()
+    print(f"Settings: type={layer_type}, quality={quality}, sigma={sigma}")
+    
+    # Create progress dialog
+    progress_dialog = QDialog()
+    progress_dialog.setWindowTitle("LoG Filter - Processing")
+    progress_dialog.setModal(True)
+    progress_dialog.setMinimumWidth(400)
+    
+    layout = QVBoxLayout()
+    status_label = QLabel("Initializing...")
+    layout.addWidget(status_label)
+    
+    progress_bar = QProgressBar()
+    progress_bar.setMinimum(0)
+    progress_bar.setMaximum(100)
+    layout.addWidget(progress_bar)
+    
+    progress_dialog.setLayout(layout)
+    
+    # Create worker
+    log_worker = LoGWorker(active_layer, layer_type, quality, sigma)
+    
+    def update_status(msg):
+        status_label.setText(msg)
+        print(f"  {msg}")
+    
+    def update_progress(val):
+        progress_bar.setValue(val)
+    
+    def on_finished(output_path):
+        progress_bar.setValue(100)
+        status_label.setText("Loading result...")
+        
+        # Add to project
+        result_layer = QgsRasterLayer(output_path, f"LoG_{active_layer.name()}")
+        if result_layer.isValid():
+            QgsProject.instance().addMapLayer(result_layer)
+            iface.setActiveLayer(result_layer)
+            iface.zoomToActiveLayer()
+            print("=" * 60)
+            print("SUCCESS! LoG filter completed successfully!")
+            print(f"Result layer: LoG_{active_layer.name()}")
+            print("=" * 60)
+            iface.messageBar().pushMessage(
+                "Success", 
+                f"LoG filter completed! Result: LoG_{active_layer.name()}", 
+                level=Qgis.Success, 
+                duration=3
+            )
+        else:
+            print("ERROR: Failed to load result layer")
+            iface.messageBar().pushMessage("Error", "Failed to load result", level=Qgis.Critical, duration=3)
+        
+        progress_dialog.accept()
+    
+    def on_error(msg):
+        print(f"ERROR: {msg[:500]}")
+        iface.messageBar().pushMessage("Error", "Processing failed. Check Python console.", level=Qgis.Critical, duration=5)
+        progress_dialog.accept()
+    
+    # Connect signals
+    log_worker.status.connect(update_status)
+    log_worker.progress.connect(update_progress)
+    log_worker.finished.connect(on_finished)
+    log_worker.error.connect(on_error)
+    
+    # Start
+    log_worker.start()
+    progress_dialog.exec_()
+
+
+# Run
+run_log_filter()
